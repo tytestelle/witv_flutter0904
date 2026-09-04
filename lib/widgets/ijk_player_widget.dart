@@ -11,6 +11,7 @@ class IjkPlayerWidget extends StatefulWidget {
   final VoidCallback? onError;
   final ValueChanged<double>? onSpeedUpdate;
   final Map<String, String>? headers;
+  final String? secretKey; // 解密密钥，酷9可能从配置或URL获取
 
   const IjkPlayerWidget({
     Key? key,
@@ -19,6 +20,7 @@ class IjkPlayerWidget extends StatefulWidget {
     this.onError,
     this.onSpeedUpdate,
     this.headers,
+    this.secretKey,
   }) : super(key: key);
 
   @override
@@ -30,7 +32,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   Timer? _speedTimer;
   bool _isLoading = true;
   late JavascriptRuntime _jsRuntime;
-  String? _cryptoScript; // 缓存脚本内容
+  bool _cryptoReady = false;
 
   Map<String, String> get _defaultHeaders => {
     'User-Agent': 'OKhttp/1.31',
@@ -52,16 +54,30 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   void initState() {
     super.initState();
     _jsRuntime = getJavascriptRuntime();
-    _loadCryptoScript();
+    _initCrypto();
     _startSpeedTimer();
   }
 
-  /// 加载 crypto.js 到内存
-  Future<void> _loadCryptoScript() async {
+  /// 加载 crypto.js 并初始化 CryptoJS
+  Future<void> _initCrypto() async {
     try {
-      _cryptoScript = await rootBundle.loadString('assets/js/crypto.js');
+      final cryptoJsContent = await rootBundle.loadString('assets/js/crypto.js');
+      // 将 crypto.js 包裹在 IIFE 中，并将 bt 挂载到全局
+      final wrappedScript = '''
+        (function() {
+          ${cryptoJsContent}
+          // 原文件末尾返回 bt，这里将其暴露到全局
+          if (typeof global !== 'undefined') {
+            global.CryptoJS = bt;
+          } else if (typeof window !== 'undefined') {
+            window.CryptoJS = bt;
+          }
+        })();
+      ''';
+      _jsRuntime.evaluate(wrappedScript);
+      _cryptoReady = true;
     } catch (e) {
-      // 如果没有 crypto.js，不影响解析
+      print('加载 CryptoJS 失败: $e');
     }
   }
 
@@ -101,7 +117,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     _play(widget.url, widget.decoderIndex);
   }
 
-  /// 核心解析：完全模仿酷9的“先请求 → 判断 → 解密 → 提取”
+  /// 核心解析：模仿酷9的流程
   Future<String> _resolveUrl(String url) async {
     // 如果已是标准流地址，直接返回
     if (url.startsWith('http') && 
@@ -110,7 +126,6 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     }
 
     try {
-      // 1. 发起HTTP请求（酷9也是这么做的）
       final response = await http.get(
         Uri.parse(url),
         headers: _mergedHeaders,
@@ -118,21 +133,19 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
       if (response.statusCode != 200) return url;
       final body = response.body.trim();
 
-      // 2. 如果 body 以 "#EXTM3U" 开头，说明本身就是m3u8
+      // 如果是 M3U8
       if (body.startsWith('#EXTM3U')) return url;
 
-      // 3. 如果 body 是 JSON，尝试提取 url 字段
+      // 如果是 JSON
       if (body.startsWith('{') || body.startsWith('[')) {
         try {
           final json = jsonDecode(body);
           if (json is Map) {
-            // 检查是否有 "url"、"data.url"、"stream_url" 等
             for (var key in ['url', 'stream_url', 'play_url', 'video_url']) {
               if (json.containsKey(key) && json[key] is String && json[key].isNotEmpty) {
                 return json[key];
               }
             }
-            // 如果嵌套在 data 中
             if (json.containsKey('data') && json['data'] is Map) {
               final data = json['data'] as Map;
               for (var key in ['url', 'stream_url', 'play_url']) {
@@ -145,14 +158,14 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
         } catch (_) {}
       }
 
-      // 4. 判断 body 是否加密（酷9常见：以 "U2FsdGVkX1" 开头）
-      if (body.startsWith('U2FsdGVkX1') && _cryptoScript != null) {
-        // 调用 crypto.js 进行 AES 解密
-        final decrypted = await _decryptWithCryptoJS(body);
+      // 检查是否 AES 加密（酷9常见）
+      if (body.startsWith('U2FsdGVkX1') && _cryptoReady) {
+        // 需要密钥：从 widget.secretKey 或从 URL 参数中提取
+        final key = widget.secretKey ?? 'your_default_key';
+        final decrypted = await _decryptAES(body, key);
         if (decrypted != null && decrypted.isNotEmpty) {
-          // 解密后可能是 JSON 或直接地址，再次提取
+          // 解密后可能是 JSON，再提取
           if (decrypted.startsWith('http')) return decrypted;
-          // 尝试从解密后的 JSON 中提取
           try {
             final json = jsonDecode(decrypted);
             if (json is Map && json.containsKey('url')) return json['url'].toString();
@@ -160,35 +173,30 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
         }
       }
 
-      // 5. 正则提取 http 链接（酷9也有类似 fallback）
+      // 正则提取
       final regex = RegExp(r'https?://[^\s"\'<>]+\.(?:m3u8|mp4|ts|flv)');
       final match = regex.firstMatch(body);
       if (match != null) return match.group(0)!;
 
-      // 6. 如果什么都没提取到，返回原 URL
       return url;
     } catch (e) {
       return url;
     }
   }
 
-  /// 使用 CryptoJS 解密字符串（酷9就是用这个库）
-  Future<String?> _decryptWithCryptoJS(String encrypted) async {
+  /// 使用 CryptoJS 解密 AES
+  Future<String?> _decryptAES(String encrypted, String key) async {
     try {
-      // 构造 JS 代码，执行解密
       final script = '''
         (function() {
-          ${_cryptoScript!}
-          // 假设加密内容是 AES 加密，用 CryptoJS.AES.decrypt
-          // 需要知道密钥和模式，酷9可能从配置中获取，这里我们模拟
-          // 实际你可能需要从 URL 或其他地方提取密钥
-          var decrypted = CryptoJS.AES.decrypt('$encrypted', 'your_secret_key');
-          return decrypted.toString(CryptoJS.enc.Utf8);
+          var decrypted = global.CryptoJS.AES.decrypt('$encrypted', '$key');
+          return decrypted.toString(global.CryptoJS.enc.Utf8);
         })()
       ''';
       final result = _jsRuntime.evaluate(script);
       return result.stringResult;
     } catch (e) {
+      print('解密失败: $e');
       return null;
     }
   }
