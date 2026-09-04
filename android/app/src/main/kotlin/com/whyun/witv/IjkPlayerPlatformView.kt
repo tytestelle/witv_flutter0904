@@ -22,9 +22,8 @@ class IjkPlayerPlatformView(
     private val viewId: Int,
 ) : PlatformView, MethodChannel.MethodCallHandler {
 
-    companion object {
-        private const val TAG = "IjkPlayerView_$viewId"
-    }
+    // 将 TAG 改为普通成员变量
+    private val TAG = "IjkPlayerView_$viewId"
 
     private val container = FrameLayout(context)
     private val textureView = TextureView(context)
@@ -146,28 +145,19 @@ class IjkPlayerPlatformView(
         }
     }
 
-    /**
-     * 构建最终请求头：合并默认头 + 用户自定义头
-     */
     private fun buildHeaders(url: String): MutableMap<String, String> {
         val headers = mutableMapOf<String, String>()
-
-        // 默认头（模拟 Chrome）
         headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         headers["Accept"] = "*/*"
         headers["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8"
         headers["Accept-Encoding"] = "gzip, deflate"
         headers["Connection"] = "keep-alive"
-        // 自动添加 Referer
         getDomainFromUrl(url)?.let {
             headers["Referer"] = it
         }
-
-        // 覆盖用户自定义头（优先级高）
         currentHeaders?.let { userHeaders ->
             headers.putAll(userHeaders)
         }
-
         Log.d(TAG, "Final headers: $headers")
         return headers
     }
@@ -176,7 +166,6 @@ class IjkPlayerPlatformView(
         val url = normalizeUrl(rawUrl)
         Log.d(TAG, "Playing URL: $url")
 
-        // 截图覆盖防黑底
         if (isSurfaceAvailable && textureView.isAvailable) {
             try {
                 val bitmap: Bitmap? = textureView.bitmap
@@ -187,10 +176,8 @@ class IjkPlayerPlatformView(
             } catch (_: Exception) {}
         }
 
-        // 构建 headers
         val headers = buildHeaders(url)
 
-        // 复用播放器
         val player = mediaPlayer
         if (player != null) {
             try {
@@ -207,7 +194,6 @@ class IjkPlayerPlatformView(
             }
         }
 
-        // 新建播放器
         val newPlayer = IjkMediaPlayer()
         mediaPlayer = newPlayer
         configurePlayer(newPlayer, currentDecoderMode)
@@ -223,7 +209,7 @@ class IjkPlayerPlatformView(
                 val newMode = if (currentDecoderMode == 0) 1 else 0
                 currentDecoderMode = newMode
                 releasePlayer()
-                setUrl(rawUrl) // 重试
+                setUrl(rawUrl)
             } else {
                 methodChannel?.invokeMethod("onError", mapOf(
                     "what" to -1,
@@ -244,12 +230,10 @@ class IjkPlayerPlatformView(
     }
 
     private fun configurePlayer(player: IjkMediaPlayer, decoderMode: Int) {
-        // 基础音频
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "opensles", 0L)
         player.setAudioStreamType(AudioManager.STREAM_MUSIC)
         player.setScreenOnWhilePlaying(true)
 
-        // 解码器
         when (decoderMode) {
             0 -> {
                 player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-all-videos", 1L)
@@ -268,12 +252,10 @@ class IjkPlayerPlatformView(
             }
         }
 
-        // 探测参数
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "probesize", 1024 * 1024L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", 10 * 1000 * 1000L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzemaxduration", 15 * 1000 * 1000L)
 
-        // 协议白名单
         player.setOption(
             IjkMediaPlayer.OPT_CATEGORY_FORMAT,
             "protocol_whitelist",
@@ -282,7 +264,6 @@ class IjkPlayerPlatformView(
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "rtsp_transport", "tcp")
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "http-detect-range-support", 0L)
 
-        // 缓冲与重连
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "packet-buffering", 1L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max-buffer-size", 4 * 1024 * 1024L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "min-frames", 3L)
@@ -298,7 +279,6 @@ class IjkPlayerPlatformView(
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "dns_cache_clear", 1L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "enable-accurate-seek", 1L)
 
-        // 监听器
         player.setOnPreparedListener { it.start() }
         player.setOnInfoListener { _, what, extra ->
             if (what == 3) {
