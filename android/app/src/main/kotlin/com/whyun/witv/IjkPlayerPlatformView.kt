@@ -31,8 +31,18 @@ class IjkPlayerPlatformView(
     private var currentSurface: Surface? = null
     private var isSurfaceAvailable = false
 
+    // 当前解码模式：0-硬解（默认），1-软解
+    private var currentDecoderMode = 0
+
     init {
         IjkMediaPlayer.loadLibrariesOnce(null)
+
+        // ========== 注册自定义协议（如需支持加密链接，请在此处添加） ==========
+        // 如果你有自己的加密协议（如 crypto://），需要在此调用 native 方法注册
+        // 例如：registerCustomProtocol() 
+        // 具体实现需参考 ijkplayer 的 custom_protocol 示例，本文末尾有注释说明
+        // 由于你的 so 是全功能的，可能已经内置了某些协议，只需在 whitelist 中启用
+        // ===================================================================
 
         container.addView(textureView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
@@ -70,7 +80,10 @@ class IjkPlayerPlatformView(
         when (call.method) {
             "setUrl" -> {
                 val url = call.argument<String>("url")
+                val decoderIndex = call.argument<Int>("decoderIndex") ?: 0
                 if (url != null) {
+                    // 支持动态切换解码模式
+                    currentDecoderMode = decoderIndex
                     setUrl(url)
                     result.success(null)
                 } else {
@@ -109,13 +122,13 @@ class IjkPlayerPlatformView(
             } catch (_: Exception) {}
         }
 
-        // 优先复用播放器
+        // 优先复用播放器（如果解码模式未变）
         val player = mediaPlayer
         if (player != null) {
             try {
                 player.stop()
                 player.reset()
-                configurePlayer(player)
+                configurePlayer(player, currentDecoderMode)
                 player.setSurface(currentSurface)
                 player.dataSource = url
                 player.prepareAsync()
@@ -125,10 +138,10 @@ class IjkPlayerPlatformView(
             }
         }
 
-        // 新建
+        // 新建播放器
         val newPlayer = IjkMediaPlayer()
         mediaPlayer = newPlayer
-        configurePlayer(newPlayer)
+        configurePlayer(newPlayer, currentDecoderMode)
         currentSurface?.let { newPlayer.setSurface(it) }
 
         try {
@@ -140,46 +153,93 @@ class IjkPlayerPlatformView(
         }
     }
 
-    private fun configurePlayer(player: IjkMediaPlayer) {
-        // ===== 音频输出（AudioTrack 兼容性最好）=====
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "opensles", 0L)
+    /**
+     * 配置播放器参数，使其兼容尽可能多的链接格式
+     * @param player 播放器实例
+     * @param decoderMode 0-硬解，1-软解
+     */
+    private fun configurePlayer(player: IjkMediaPlayer, decoderMode: Int) {
+        // ===== 1. 基础音频设置 =====
+        player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "opensles", 0L) // 使用 AudioTrack，兼容性更好
         player.setAudioStreamType(AudioManager.STREAM_MUSIC)
         player.setScreenOnWhilePlaying(true)
 
-        // ===== 硬解（视频）音频软解（兼容所有格式）=====
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-all-videos", 1L)
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-avc", 1L)
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-hevc", 1L)
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-all-audio", 0L)
+        // ===== 2. 解码器选择 =====
+        when (decoderMode) {
+            0 -> {
+                // 硬解：性能高，但某些编码或不标准流可能花屏
+                player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-all-videos", 1L)
+                player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-avc", 1L)
+                player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-hevc", 1L)
+                // 音频强制软解，避免硬解兼容性问题
+                player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-all-audio", 0L)
+                // 硬解时适当丢帧以保证流畅
+                player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "framedrop", 3L)
+            }
+            1 -> {
+                // 软解：兼容性最好，但 CPU 负载高
+                player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-all-videos", 0L)
+                player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-avc", 0L)
+                player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-hevc", 0L)
+                player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-all-audio", 0L)
+                // 软解时多线程解码
+                player.setOption(IjkMediaPlayer.OPT_CATEGORY_CODEC, "threads", 4L)
+                // 软解可更积极丢帧以防止音视频不同步
+                player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "framedrop", 5L)
+            }
+        }
 
-        // ===== 核心：探测参数足够大，确保识别所有音频格式 =====
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "probesize", (512 * 1024).toLong())          // 512KB
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", (3 * 1000 * 1000).toLong()) // 3秒
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzemaxduration", (8 * 1000 * 1000).toLong()) // 8秒上限
+        // ===== 3. 核心：探测参数调大，确保能识别各种格式 =====
+        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "probesize", 1024 * 1024L)        // 1MB
+        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", 10 * 1000 * 1000L) // 10秒
+        // 有些流需要更长的分析时间，但设置上限避免无限等待
+        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzemaxduration", 15 * 1000 * 1000L)
 
-        // TS / m3u8 专用
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "fflags", "fastseek+flush_packets")
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "flush_packets", 1L)
-
-        // 网络优化
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "http-detect-range-support", 0L)
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "dns_cache_clear", 0L)
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "dns_cache_timeout", -1L)
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "protocol_whitelist", "file,http,https,tcp,tls,crypto")
+        // ===== 4. 网络协议白名单：尽可能全 =====
+        // 包含常见协议及加密协议 (crypto)
+        player.setOption(
+            IjkMediaPlayer.OPT_CATEGORY_FORMAT,
+            "protocol_whitelist",
+            "file,http,https,tcp,tls,crypto,rtsp,rtp,udp,rtmp,rtmps,rtmpt,rtmpts,ftp,ftps,srt,srtp,data,zip,gopher"
+        )
+        // 针对 RTSP 强制使用 TCP（兼容性更好）
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "rtsp_transport", "tcp")
+        // 禁用 HTTP 范围请求（某些服务器不支持，会导致失败）
+        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "http-detect-range-support", 0L)
 
-        // ===== 缓冲策略 =====
+        // ===== 5. HTTP 请求头模拟（模拟浏览器，绕过一些限制） =====
+        player.setOption(
+            IjkMediaPlayer.OPT_CATEGORY_FORMAT,
+            "user_agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        // 添加常用 Referer（可根据需要动态设置）
+        // player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "referer", "https://example.com")
+        // 添加 Cookie（如果需要）
+        // player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "cookies", "name=value")
+
+        // ===== 6. 缓存与缓冲策略 =====
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "packet-buffering", 1L)
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max-buffer-size", (1024 * 1024).toLong())
+        player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max-buffer-size", 2 * 1024 * 1024L) // 2MB
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "min-frames", 3L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "start-on-prepared", 1L)
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "framedrop", 5L)
 
-        // 超时与重连
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "timeout", (10 * 1000 * 1000).toLong())
+        // ===== 7. 网络超时与重连 =====
+        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "timeout", 15 * 1000 * 1000L) // 15秒
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "reconnect", 1L)
+        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "reconnect_at_eof", 1L)
+        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "reconnect_streamed", 1L)
+        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "reconnect_delay_max", 5L)
 
-        // ===== 监听器 =====
+        // ===== 8. 其他优化 =====
+        // 允许快速 seek
+        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "fflags", "fastseek+flush_packets")
+        // 清除 DNS 缓存（避免解析问题）
+        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "dns_cache_clear", 1L)
+        // 针对 HLS 的特殊优化
+        player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "hls_playlist_type", 0L) // 0: 自适应
+
+        // ===== 9. 监听器 =====
         player.setOnPreparedListener { it.start() }
         player.setOnInfoListener { _, what, extra ->
             if (what == 3) { // 首帧渲染
@@ -221,4 +281,19 @@ class IjkPlayerPlatformView(
         methodChannel?.setMethodCallHandler(null)
         releasePlayer()
     }
+
+    // ========== 扩展说明：如何支持自定义加密协议（crypto://） ==========
+    /*
+     * 如果你的加密链接是 crypto://...，且 FFmpeg 中并未内置该协议，
+     * 你需要实现一个自定义 URLProtocol，并在 IjkMediaPlayer 初始化前注册。
+     * 参考 ijkplayer 官方示例：https://github.com/bilibili/ijkplayer/tree/master/android/ijkplayer-example/src/main/java/tv/danmaku/ijk/media/player/misc
+     * 
+     * 简略步骤：
+     * 1. 在 JNI 层实现 av_register_protocol2，注册一个名为 "crypto" 的协议。
+     * 2. 在 open 回调中获取密钥（可从 URL 参数或 MethodChannel 传入），
+     *    在 read 回调中解密数据并返回。
+     * 3. 在 init 块中调用注册函数。
+     * 
+     * 如果你的 so 已内置该协议，则只需在 protocol_whitelist 中添加 "crypto" 即可。
+     */
 }
