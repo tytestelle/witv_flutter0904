@@ -11,7 +11,7 @@ class IjkPlayerWidget extends StatefulWidget {
   final VoidCallback? onError;
   final ValueChanged<double>? onSpeedUpdate;
   final Map<String, String>? headers;
-  final String? secretKey; // 解密密钥，酷9可能从配置或URL获取
+  final String? secretKey; // 解密密钥，从外部传入
 
   const IjkPlayerWidget({
     Key? key,
@@ -58,15 +58,13 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     _startSpeedTimer();
   }
 
-  /// 加载 crypto.js 并初始化 CryptoJS
   Future<void> _initCrypto() async {
     try {
       final cryptoJsContent = await rootBundle.loadString('assets/js/crypto.js');
-      // 将 crypto.js 包裹在 IIFE 中，并将 bt 挂载到全局
+      // 将 crypto.js 包装并暴露 CryptoJS 到全局
       final wrappedScript = '''
         (function() {
           ${cryptoJsContent}
-          // 原文件末尾返回 bt，这里将其暴露到全局
           if (typeof global !== 'undefined') {
             global.CryptoJS = bt;
           } else if (typeof window !== 'undefined') {
@@ -76,6 +74,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
       ''';
       _jsRuntime.evaluate(wrappedScript);
       _cryptoReady = true;
+      print('CryptoJS 加载成功');
     } catch (e) {
       print('加载 CryptoJS 失败: $e');
     }
@@ -133,10 +132,10 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
       if (response.statusCode != 200) return url;
       final body = response.body.trim();
 
-      // 如果是 M3U8
+      // 1. M3U8
       if (body.startsWith('#EXTM3U')) return url;
 
-      // 如果是 JSON
+      // 2. JSON
       if (body.startsWith('{') || body.startsWith('[')) {
         try {
           final json = jsonDecode(body);
@@ -158,13 +157,11 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
         } catch (_) {}
       }
 
-      // 检查是否 AES 加密（酷9常见）
+      // 3. AES 加密（酷9常见格式：U2FsdGVkX1...）
       if (body.startsWith('U2FsdGVkX1') && _cryptoReady) {
-        // 需要密钥：从 widget.secretKey 或从 URL 参数中提取
-        final key = widget.secretKey ?? 'your_default_key';
+        final key = widget.secretKey ?? 'default_key'; // 请替换为实际密钥
         final decrypted = await _decryptAES(body, key);
         if (decrypted != null && decrypted.isNotEmpty) {
-          // 解密后可能是 JSON，再提取
           if (decrypted.startsWith('http')) return decrypted;
           try {
             final json = jsonDecode(decrypted);
@@ -173,8 +170,8 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
         }
       }
 
-      // 正则提取
-      final regex = RegExp(r'https?://[^\s"\'<>]+\.(?:m3u8|mp4|ts|flv)');
+      // 4. 正则提取 URL（修正：使用双引号原始字符串）
+      final regex = RegExp(r"https?://[^\s\"'<>]+\.(?:m3u8|mp4|ts|flv)");
       final match = regex.firstMatch(body);
       if (match != null) return match.group(0)!;
 
