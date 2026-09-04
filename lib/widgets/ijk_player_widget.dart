@@ -61,7 +61,6 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   Future<void> _initCrypto() async {
     try {
       final cryptoJsContent = await rootBundle.loadString('assets/js/crypto.js');
-      // 包装脚本，暴露 CryptoJS 到全局
       final wrappedScript = '''
         (function() {
           ${cryptoJsContent}
@@ -74,9 +73,9 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
       ''';
       _jsRuntime.evaluate(wrappedScript);
       _cryptoReady = true;
-      print('CryptoJS 加载成功');
+      print('IjkPlayer: CryptoJS 加载成功');
     } catch (e) {
-      print('加载 CryptoJS 失败: $e');
+      print('IjkPlayer: CryptoJS 加载失败: $e');
     }
   }
 
@@ -102,11 +101,13 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     _channel?.setMethodCallHandler((call) async {
       switch (call.method) {
         case 'onError':
+          print('IjkPlayer: 播放器错误回调');
           if (mounted) setState(() => _isLoading = false);
           widget.onError?.call();
           break;
         case 'onInfo':
           final what = call.arguments['what'] as int?;
+          print('IjkPlayer: onInfo what=$what');
           if (what == 3 && mounted) {
             setState(() => _isLoading = false);
           }
@@ -116,32 +117,41 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     _play(widget.url, widget.decoderIndex);
   }
 
-  /// 核心解析：模仿酷9的流程
   Future<String> _resolveUrl(String url) async {
-    // 如果已是标准流地址，直接返回
+    print('IjkPlayer: 开始解析 URL: $url');
     if (url.startsWith('http') && 
         (url.endsWith('.m3u8') || url.endsWith('.mp4') || url.endsWith('.ts') || url.endsWith('.flv'))) {
+      print('IjkPlayer: URL 已是标准流，直接返回');
       return url;
     }
 
     try {
+      print('IjkPlayer: 发起 HTTP 请求...');
       final response = await http.get(
         Uri.parse(url),
         headers: _mergedHeaders,
       );
-      if (response.statusCode != 200) return url;
+      print('IjkPlayer: HTTP 状态码: ${response.statusCode}');
+      if (response.statusCode != 200) {
+        print('IjkPlayer: HTTP 非200，返回原URL');
+        return url;
+      }
       final body = response.body.trim();
+      print('IjkPlayer: 响应体前200字符: ${body.substring(0, body.length > 200 ? 200 : body.length)}');
 
-      // 1. M3U8
-      if (body.startsWith('#EXTM3U')) return url;
+      if (body.startsWith('#EXTM3U')) {
+        print('IjkPlayer: 响应是 M3U8，返回原URL');
+        return url;
+      }
 
-      // 2. JSON
       if (body.startsWith('{') || body.startsWith('[')) {
         try {
           final json = jsonDecode(body);
+          print('IjkPlayer: JSON 解析成功');
           if (json is Map) {
             for (var key in ['url', 'stream_url', 'play_url', 'video_url']) {
               if (json.containsKey(key) && json[key] is String && json[key].isNotEmpty) {
+                print('IjkPlayer: 从 JSON 提取到地址: ${json[key]}');
                 return json[key];
               }
             }
@@ -149,28 +159,36 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
               final data = json['data'] as Map;
               for (var key in ['url', 'stream_url', 'play_url']) {
                 if (data.containsKey(key) && data[key] is String && data[key].isNotEmpty) {
+                  print('IjkPlayer: 从 JSON.data 提取到地址: ${data[key]}');
                   return data[key];
                 }
               }
             }
           }
-        } catch (_) {}
+        } catch (e) {
+          print('IjkPlayer: JSON 解析失败: $e');
+        }
       }
 
-      // 3. AES 加密（酷9常见格式：U2FsdGVkX1...）
+      // AES 加密
       if (body.startsWith('U2FsdGVkX1') && _cryptoReady) {
+        print('IjkPlayer: 检测到 AES 加密数据，尝试解密...');
         final key = widget.secretKey ?? 'default_key';
         final decrypted = await _decryptAES(body, key);
         if (decrypted != null && decrypted.isNotEmpty) {
+          print('IjkPlayer: 解密结果: $decrypted');
           if (decrypted.startsWith('http')) return decrypted;
           try {
             final json = jsonDecode(decrypted);
-            if (json is Map && json.containsKey('url')) return json['url'].toString();
+            if (json is Map && json.containsKey('url')) {
+              print('IjkPlayer: 从解密后的 JSON 提取到地址: ${json['url']}');
+              return json['url'];
+            }
           } catch (_) {}
         }
       }
 
-      // 4. 简单提取：查找 http:// 开头的链接（避免正则转义问题）
+      // 简单提取 http://
       final start = body.indexOf('http://');
       if (start != -1) {
         final end = body.indexOf(' ', start);
@@ -179,18 +197,19 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
             candidate.endsWith('.mp4') || 
             candidate.endsWith('.ts') || 
             candidate.endsWith('.flv')) {
+          print('IjkPlayer: 从响应中提取到候选地址: $candidate');
           return candidate;
         }
       }
 
-      // 5. 如果什么都没提取到，返回原 URL
+      print('IjkPlayer: 未找到有效地址，返回原URL');
       return url;
     } catch (e) {
+      print('IjkPlayer: 解析异常: $e');
       return url;
     }
   }
 
-  /// 使用 CryptoJS 解密 AES
   Future<String?> _decryptAES(String encrypted, String key) async {
     try {
       final script = '''
@@ -202,7 +221,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
       final result = _jsRuntime.evaluate(script);
       return result.stringResult;
     } catch (e) {
-      print('解密失败: $e');
+      print('IjkPlayer: AES 解密失败: $e');
       return null;
     }
   }
@@ -210,6 +229,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   Future<void> _play(String url, int decoderIndex) async {
     if (mounted) setState(() => _isLoading = true);
     final realUrl = await _resolveUrl(url);
+    print('IjkPlayer: 最终播放地址: $realUrl');
     _channel?.invokeMethod('setUrl', {
       'url': realUrl,
       'decoderIndex': decoderIndex,
