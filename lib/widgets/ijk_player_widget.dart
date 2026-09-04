@@ -7,7 +7,7 @@ class IjkPlayerWidget extends StatefulWidget {
   final int decoderIndex;
   final VoidCallback? onError;
   final ValueChanged<double>? onSpeedUpdate;
-  /// 可选的自定义请求头，会覆盖默认头
+  /// 可选的自定义请求头（会与默认合并，自定义优先）
   final Map<String, String>? headers;
 
   const IjkPlayerWidget({
@@ -28,7 +28,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   Timer? _speedTimer;
   bool _isLoading = true;
 
-  /// 默认请求头（模仿酷9的 OKhttp/1.31）
+  /// 默认请求头（模拟酷9）
   Map<String, String> get _defaultHeaders => {
     'User-Agent': 'OKhttp/1.31',
     'Accept': '*/*',
@@ -37,7 +37,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     'Connection': 'keep-alive',
   };
 
-  /// 合并默认头和自定义头
+  /// 合并默认头和自定义头（自定义优先）
   Map<String, String> get _mergedHeaders {
     final base = Map<String, String>.from(_defaultHeaders);
     if (widget.headers != null) {
@@ -93,7 +93,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     _channel?.invokeMethod('setUrl', {
       'url': url,
       'decoderIndex': decoderIndex,
-      'headers': _mergedHeaders,   // 传递合并后的请求头
+      'headers': _mergedHeaders,   // 关键：传递 headers
     });
   }
 
