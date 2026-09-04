@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
 import android.media.AudioManager
+import android.net.Uri
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
@@ -33,10 +34,11 @@ class IjkPlayerPlatformView(
     private var isSurfaceAvailable = false
     private var currentDecoderMode = 0
     private var retryCount = 0
-    private val maxRetries = 1 // 最多重试一次（切换解码方式）
+    private val maxRetries = 1
 
-    // 额外请求头（可由 Flutter 传入）
-    private var extraHeaders: Map<String, String>? = null
+    // 存储当前应用的额外请求头
+    private var currentHeaders: Map<String, String>? = null
+    private val contextRef = context
 
     init {
         IjkMediaPlayer.loadLibrariesOnce(null)
@@ -78,10 +80,10 @@ class IjkPlayerPlatformView(
             "setUrl" -> {
                 val url = call.argument<String>("url")
                 val decoderIndex = call.argument<Int>("decoderIndex") ?: 0
-                val headers = call.argument<Map<String, String>>("headers") // 可选
+                val headers = call.argument<Map<String, String>>("headers") // 接收 headers
                 if (url != null) {
                     currentDecoderMode = decoderIndex
-                    extraHeaders = headers
+                    currentHeaders = headers
                     retryCount = 0
                     setUrl(url)
                     result.success(null)
@@ -110,12 +112,10 @@ class IjkPlayerPlatformView(
     }
 
     /**
-     * URL 规范化：补全协议、处理特殊格式（如 9:2203/...）
+     * URL 规范化
      */
     private fun normalizeUrl(rawUrl: String): String {
         var normalized = rawUrl.trim()
-
-        // 匹配 "数字:数字/..." 格式
         val specialRegex = Regex("""^(\d+):(\d+)/(.*)$""")
         val match = specialRegex.find(normalized)
         if (match != null) {
@@ -123,7 +123,6 @@ class IjkPlayerPlatformView(
             val path = match.groupValues[3]
             normalized = "http://$host/$path"
         } else {
-            // 检查是否已有协议头
             val hasProtocol = normalized.startsWith("http://") ||
                     normalized.startsWith("https://") ||
                     normalized.startsWith("rtmp://") ||
@@ -131,7 +130,6 @@ class IjkPlayerPlatformView(
                     normalized.startsWith("file://") ||
                     normalized.startsWith("crypto://") ||
                     normalized.startsWith("ftp://")
-
             if (!hasProtocol) {
                 normalized = "http://$normalized"
             }
@@ -139,9 +137,6 @@ class IjkPlayerPlatformView(
         return normalized
     }
 
-    /**
-     * 从 URL 中提取域名作为 Referer
-     */
     private fun getDomainFromUrl(url: String): String? {
         return try {
             val uri = URL(url)
@@ -165,7 +160,7 @@ class IjkPlayerPlatformView(
             } catch (_: Exception) {}
         }
 
-        // 复用或新建播放器
+        // 复用播放器（注意：需要重新设置headers，因为reset会清空）
         val player = mediaPlayer
         if (player != null) {
             try {
@@ -173,7 +168,8 @@ class IjkPlayerPlatformView(
                 player.reset()
                 configurePlayer(player, currentDecoderMode, url)
                 player.setSurface(currentSurface)
-                player.dataSource = url
+                // 使用带 headers 的 setDataSource
+                applyDataSource(player, url)
                 player.prepareAsync()
                 return
             } catch (_: Exception) {
@@ -181,22 +177,21 @@ class IjkPlayerPlatformView(
             }
         }
 
+        // 新建播放器
         val newPlayer = IjkMediaPlayer()
         mediaPlayer = newPlayer
         configurePlayer(newPlayer, currentDecoderMode, url)
         currentSurface?.let { newPlayer.setSurface(it) }
 
         try {
-            newPlayer.dataSource = url
+            applyDataSource(newPlayer, url)
             newPlayer.prepareAsync()
         } catch (e: Exception) {
             e.printStackTrace()
-            // 播放失败，尝试切换解码模式重试
             if (retryCount < maxRetries) {
                 retryCount++
                 val newMode = if (currentDecoderMode == 0) 1 else 0
                 currentDecoderMode = newMode
-                // 重新创建播放器并重试
                 releasePlayer()
                 setUrl(rawUrl) // 递归重试
             } else {
@@ -206,7 +201,21 @@ class IjkPlayerPlatformView(
     }
 
     /**
-     * 配置播放器参数，针对特定 URL 添加动态请求头
+     * 根据是否有 headers，选择不同的 setDataSource 方法
+     */
+    private fun applyDataSource(player: IjkMediaPlayer, url: String) {
+        val headers = currentHeaders
+        if (headers != null && headers.isNotEmpty()) {
+            // 使用带 headers 的重载
+            player.setDataSource(contextRef, Uri.parse(url), headers)
+        } else {
+            // 普通方式
+            player.dataSource = url
+        }
+    }
+
+    /**
+     * 配置播放器参数（同之前，保持不变，但确保 Referer 也通过 headers 方式可覆盖）
      */
     private fun configurePlayer(player: IjkMediaPlayer, decoderMode: Int, url: String) {
         // ===== 基础音频 =====
@@ -247,27 +256,20 @@ class IjkPlayerPlatformView(
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "rtsp_transport", "tcp")
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "http-detect-range-support", 0L)
 
-        // ===== 请求头模拟 =====
-        // User-Agent
+        // ===== 请求头模拟（基础） =====
         player.setOption(
             IjkMediaPlayer.OPT_CATEGORY_FORMAT,
             "user_agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
-        // Referer：自动从 URL 提取域名
+        // Referer：自动添加，但可通过 headers 覆盖
         getDomainFromUrl(url)?.let { domain ->
             player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "referer", domain)
-        }
-        // 额外自定义头部（如果有）
-        extraHeaders?.forEach { (key, value) ->
-            // ijkplayer 支持设置自定义 HTTP 头，通过 "headers" 选项，格式为 "key1:value1\r\nkey2:value2"
-            // 但 setOption 不支持直接设置，需通过 setDataSource 的 Map 形式传入。
-            // 这里我们采用 setDataSource 的重载，稍后处理。
         }
 
         // ===== 缓冲与重连 =====
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "packet-buffering", 1L)
-        player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max-buffer-size", 4 * 1024 * 1024L) // 4MB
+        player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max-buffer-size", 4 * 1024 * 1024L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "min-frames", 3L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "start-on-prepared", 1L)
 
@@ -277,7 +279,6 @@ class IjkPlayerPlatformView(
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "reconnect_streamed", 1L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "reconnect_delay_max", 5L)
 
-        // 针对 HLS/TS 优化
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "fflags", "fastseek+flush_packets")
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "dns_cache_clear", 1L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "enable-accurate-seek", 1L)
@@ -299,8 +300,6 @@ class IjkPlayerPlatformView(
                 snapView.visibility = View.GONE
                 snapView.setImageBitmap(null)
             }
-            // 错误发生时，尝试切换解码模式重试（但此回调可能已发生）
-            // 我们可以在外部 setUrl 中处理重试，这里只报告错误
             methodChannel?.invokeMethod("onError", mapOf("what" to what, "extra" to extra))
             true
         }
