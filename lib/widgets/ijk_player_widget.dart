@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_js/flutter_js.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 
@@ -28,6 +29,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   MethodChannel? _channel;
   Timer? _speedTimer;
   bool _isLoading = true;
+  late JavascriptRuntime _jsRuntime;
 
   Map<String, String> get _defaultHeaders => {
     'User-Agent': 'OKhttp/1.31',
@@ -49,6 +51,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   void initState() {
     super.initState();
     _startSpeedTimer();
+    _jsRuntime = getJavascriptRuntime(); // 初始化 JS 引擎
   }
 
   @override
@@ -87,32 +90,71 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     _play(widget.url, widget.decoderIndex);
   }
 
-  /// 解析 URL，提取真实视频地址
+  /// 核心解析方法：先尝试 JS 脚本，再 fallback 到 HTTP 解析
   Future<String> _resolveUrl(String url) async {
-    // 如果已经是标准流地址，直接返回
+    // 1. 如果是标准流地址，直接返回
     if (url.startsWith('http') && 
         (url.endsWith('.m3u8') || url.endsWith('.mp4') || url.endsWith('.ts') || url.endsWith('.flv'))) {
       return url;
     }
 
+    // 2. 尝试加载对应域名的 JS 脚本（可配置映射）
+    String? domain;
+    try {
+      final uri = Uri.parse(url);
+      domain = uri.host;
+    } catch (_) {}
+
+    if (domain != null) {
+      // 尝试加载 assets/js/${domain}.js
+      final scriptContent = await _loadScriptForDomain(domain);
+      if (scriptContent != null) {
+        try {
+          // 执行脚本，调用 parse(url)
+          final result = _jsRuntime.evaluate('''
+            (function() {
+              $scriptContent
+              if (typeof parse === 'function') {
+                return parse('$url');
+              }
+              return null;
+            })()
+          ''');
+          if (result.stringResult != null && result.stringResult!.isNotEmpty) {
+            return result.stringResult!;
+          }
+        } catch (e) {
+          // JS 执行出错，继续 fallback
+        }
+      }
+    }
+
+    // 3. Fallback：HTTP 请求 + 正则/JSON 提取
+    return await _httpResolve(url);
+  }
+
+  /// 从 assets 加载对应域名的 JS 脚本
+  Future<String?> _loadScriptForDomain(String domain) async {
+    try {
+      // 假设脚本存放在 assets/js/ 下，文件名为域名.js
+      return await rootBundle.loadString('assets/js/$domain.js');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// HTTP 解析方式（和之前一样）
+  Future<String> _httpResolve(String url) async {
     try {
       final response = await http.get(
         Uri.parse(url),
-        headers: _mergedHeaders, // 使用和播放器相同的 headers
+        headers: _mergedHeaders,
       );
-
-      if (response.statusCode != 200) {
-        return url;
-      }
-
+      if (response.statusCode != 200) return url;
       final body = response.body.trim();
 
-      // 1. M3U8
-      if (body.startsWith('#EXTM3U')) {
-        return url;
-      }
+      if (body.startsWith('#EXTM3U')) return url;
 
-      // 2. JSON
       if (body.startsWith('{') || body.startsWith('[')) {
         try {
           final json = jsonDecode(body);
@@ -125,15 +167,12 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
         } catch (_) {}
       }
 
-      // 3. 正则提取
       final regex = RegExp(r'https?://[^\s"\'<>]+\.(?:m3u8|mp4|ts|flv)');
       final match = regex.firstMatch(body);
-      if (match != null) {
-        return match.group(0)!;
-      }
+      if (match != null) return match.group(0)!;
 
       return url;
-    } catch (e) {
+    } catch (_) {
       return url;
     }
   }
@@ -152,6 +191,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   void dispose() {
     _speedTimer?.cancel();
     _channel?.invokeMethod('release');
+    _jsRuntime.dispose();
     super.dispose();
   }
 
