@@ -1,14 +1,15 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import '../parsers/video_parser.dart'; // 引入解析器
 
 class IjkPlayerWidget extends StatefulWidget {
   final String url;
   final int decoderIndex;
   final VoidCallback? onError;
   final ValueChanged<double>? onSpeedUpdate;
-  /// 可选的自定义请求头（会与默认合并，自定义优先）
   final Map<String, String>? headers;
+  final VideoParser? parser; // 自定义解析器
 
   const IjkPlayerWidget({
     Key? key,
@@ -17,6 +18,7 @@ class IjkPlayerWidget extends StatefulWidget {
     this.onError,
     this.onSpeedUpdate,
     this.headers,
+    this.parser,
   }) : super(key: key);
 
   @override
@@ -27,17 +29,16 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   MethodChannel? _channel;
   Timer? _speedTimer;
   bool _isLoading = true;
+  bool _isParsing = false; // 新增解析状态
 
-  /// 默认请求头（模拟酷9）
   Map<String, String> get _defaultHeaders => {
     'User-Agent': 'OKhttp/1.31',
     'Accept': '*/*',
     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    'Accept-Encoding': 'gzip, deflate',
+    'Accept-Encoding': 'identity',
     'Connection': 'keep-alive',
   };
 
-  /// 合并默认头和自定义头（自定义优先）
   Map<String, String> get _mergedHeaders {
     final base = Map<String, String>.from(_defaultHeaders);
     if (widget.headers != null) {
@@ -50,6 +51,8 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   void initState() {
     super.initState();
     _startSpeedTimer();
+    // 初始化时解析URL
+    _resolveAndPlay();
   }
 
   @override
@@ -57,8 +60,9 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     super.didUpdateWidget(oldWidget);
     if (widget.url != oldWidget.url ||
         widget.decoderIndex != oldWidget.decoderIndex ||
-        widget.headers != oldWidget.headers) {
-      _setUrl(widget.url, widget.decoderIndex);
+        widget.headers != oldWidget.headers ||
+        widget.parser != oldWidget.parser) {
+      _resolveAndPlay();
     }
   }
 
@@ -85,7 +89,26 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
           break;
       }
     });
-    _setUrl(widget.url, widget.decoderIndex);
+    // 注意：播放器的创建在 _resolveAndPlay 中完成
+  }
+
+  /// 解析URL并播放
+  Future<void> _resolveAndPlay() async {
+    if (mounted) setState(() => _isParsing = true);
+    try {
+      // 如果提供了自定义解析器，使用它；否则使用默认解析器
+      final parser = widget.parser ?? DefaultVideoParser.parse;
+      final realUrl = await parser(widget.url);
+      if (mounted) {
+        setState(() => _isParsing = false);
+        _setUrl(realUrl, widget.decoderIndex);
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _isParsing = false);
+        _setUrl(widget.url, widget.decoderIndex); // 解析失败时尝试原始URL
+      }
+    }
   }
 
   void _setUrl(String url, int decoderIndex) {
@@ -93,7 +116,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     _channel?.invokeMethod('setUrl', {
       'url': url,
       'decoderIndex': decoderIndex,
-      'headers': _mergedHeaders,   // 关键：传递 headers
+      'headers': _mergedHeaders,
     });
   }
 
@@ -118,7 +141,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
           creationParamsCodec: const StandardMessageCodec(),
           onPlatformViewCreated: _onPlatformViewCreated,
         ),
-        if (_isLoading)
+        if (_isLoading || _isParsing)
           Container(
             color: Colors.black,
             child: const Center(
