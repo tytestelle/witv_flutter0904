@@ -22,7 +22,6 @@ class IjkPlayerPlatformView(
     private val viewId: Int,
 ) : PlatformView, MethodChannel.MethodCallHandler {
 
-    // 将 TAG 改为普通成员变量
     private val TAG = "IjkPlayerView_$viewId"
 
     private val container = FrameLayout(context)
@@ -113,6 +112,9 @@ class IjkPlayerPlatformView(
         }
     }
 
+    /**
+     * URL 规范化：处理特殊格式（如 9:2203/...）并补全协议
+     */
     private fun normalizeUrl(rawUrl: String): String {
         var normalized = rawUrl.trim()
         val specialRegex = Regex("""^(\d+):(\d+)/(.*)$""")
@@ -145,16 +147,22 @@ class IjkPlayerPlatformView(
         }
     }
 
+    /**
+     * 构建最终请求头：默认头 + 用户自定义头（用户自定义优先）
+     */
     private fun buildHeaders(url: String): MutableMap<String, String> {
         val headers = mutableMapOf<String, String>()
-        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        // 默认头 – 模仿酷9使用的 OKhttp/1.31
+        headers["User-Agent"] = "OKhttp/1.31"
         headers["Accept"] = "*/*"
         headers["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8"
         headers["Accept-Encoding"] = "gzip, deflate"
         headers["Connection"] = "keep-alive"
+        // 自动添加 Referer（可从 URL 提取域名）
         getDomainFromUrl(url)?.let {
             headers["Referer"] = it
         }
+        // 用户自定义覆盖
         currentHeaders?.let { userHeaders ->
             headers.putAll(userHeaders)
         }
@@ -166,6 +174,7 @@ class IjkPlayerPlatformView(
         val url = normalizeUrl(rawUrl)
         Log.d(TAG, "Playing URL: $url")
 
+        // 截图覆盖防黑底
         if (isSurfaceAvailable && textureView.isAvailable) {
             try {
                 val bitmap: Bitmap? = textureView.bitmap
@@ -178,6 +187,7 @@ class IjkPlayerPlatformView(
 
         val headers = buildHeaders(url)
 
+        // 尝试复用播放器
         val player = mediaPlayer
         if (player != null) {
             try {
@@ -194,6 +204,7 @@ class IjkPlayerPlatformView(
             }
         }
 
+        // 新建播放器
         val newPlayer = IjkMediaPlayer()
         mediaPlayer = newPlayer
         configurePlayer(newPlayer, currentDecoderMode)
@@ -209,7 +220,7 @@ class IjkPlayerPlatformView(
                 val newMode = if (currentDecoderMode == 0) 1 else 0
                 currentDecoderMode = newMode
                 releasePlayer()
-                setUrl(rawUrl)
+                setUrl(rawUrl) // 递归重试（切换解码方式）
             } else {
                 methodChannel?.invokeMethod("onError", mapOf(
                     "what" to -1,
@@ -230,19 +241,21 @@ class IjkPlayerPlatformView(
     }
 
     private fun configurePlayer(player: IjkMediaPlayer, decoderMode: Int) {
+        // 基础音频设置
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "opensles", 0L)
         player.setAudioStreamType(AudioManager.STREAM_MUSIC)
         player.setScreenOnWhilePlaying(true)
 
+        // 解码器选择
         when (decoderMode) {
-            0 -> {
+            0 -> { // 硬解
                 player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-all-videos", 1L)
                 player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-avc", 1L)
                 player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-hevc", 1L)
                 player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-all-audio", 0L)
                 player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "framedrop", 3L)
             }
-            1 -> {
+            1 -> { // 软解
                 player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-all-videos", 0L)
                 player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-avc", 0L)
                 player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-hevc", 0L)
@@ -252,10 +265,12 @@ class IjkPlayerPlatformView(
             }
         }
 
+        // 探测参数（加大以识别更多格式）
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "probesize", 1024 * 1024L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", 10 * 1000 * 1000L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzemaxduration", 15 * 1000 * 1000L)
 
+        // 协议白名单（包含常见协议及 crypto）
         player.setOption(
             IjkMediaPlayer.OPT_CATEGORY_FORMAT,
             "protocol_whitelist",
@@ -264,6 +279,7 @@ class IjkPlayerPlatformView(
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "rtsp_transport", "tcp")
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "http-detect-range-support", 0L)
 
+        // 缓冲与重连
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "packet-buffering", 1L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max-buffer-size", 4 * 1024 * 1024L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "min-frames", 3L)
@@ -279,9 +295,10 @@ class IjkPlayerPlatformView(
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "dns_cache_clear", 1L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "enable-accurate-seek", 1L)
 
+        // 监听器
         player.setOnPreparedListener { it.start() }
         player.setOnInfoListener { _, what, extra ->
-            if (what == 3) {
+            if (what == 3) { // 首帧渲染
                 snapView.post {
                     snapView.visibility = View.GONE
                     snapView.setImageBitmap(null)
