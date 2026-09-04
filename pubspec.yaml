@@ -37,6 +37,7 @@ flutter:
   assets:
     - assets/configuration.json
     - assets/epg_data.json
+    - assets/js/
  
     
 
