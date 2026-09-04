@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
 import android.media.AudioManager
 import android.net.Uri
+import android.util.Log
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
@@ -21,6 +22,10 @@ class IjkPlayerPlatformView(
     private val viewId: Int,
 ) : PlatformView, MethodChannel.MethodCallHandler {
 
+    companion object {
+        private const val TAG = "IjkPlayerView_$viewId"
+    }
+
     private val container = FrameLayout(context)
     private val textureView = TextureView(context)
     private val snapView = ImageView(context).apply {
@@ -35,8 +40,6 @@ class IjkPlayerPlatformView(
     private var currentDecoderMode = 0
     private var retryCount = 0
     private val maxRetries = 1
-
-    // 存储当前应用的额外请求头
     private var currentHeaders: Map<String, String>? = null
     private val contextRef = context
 
@@ -80,7 +83,7 @@ class IjkPlayerPlatformView(
             "setUrl" -> {
                 val url = call.argument<String>("url")
                 val decoderIndex = call.argument<Int>("decoderIndex") ?: 0
-                val headers = call.argument<Map<String, String>>("headers") // 接收 headers
+                val headers = call.argument<Map<String, String>>("headers")
                 if (url != null) {
                     currentDecoderMode = decoderIndex
                     currentHeaders = headers
@@ -111,9 +114,6 @@ class IjkPlayerPlatformView(
         }
     }
 
-    /**
-     * URL 规范化
-     */
     private fun normalizeUrl(rawUrl: String): String {
         var normalized = rawUrl.trim()
         val specialRegex = Regex("""^(\d+):(\d+)/(.*)$""")
@@ -146,8 +146,35 @@ class IjkPlayerPlatformView(
         }
     }
 
+    /**
+     * 构建最终请求头：合并默认头 + 用户自定义头
+     */
+    private fun buildHeaders(url: String): MutableMap<String, String> {
+        val headers = mutableMapOf<String, String>()
+
+        // 默认头（模拟 Chrome）
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        headers["Accept"] = "*/*"
+        headers["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8"
+        headers["Accept-Encoding"] = "gzip, deflate"
+        headers["Connection"] = "keep-alive"
+        // 自动添加 Referer
+        getDomainFromUrl(url)?.let {
+            headers["Referer"] = it
+        }
+
+        // 覆盖用户自定义头（优先级高）
+        currentHeaders?.let { userHeaders ->
+            headers.putAll(userHeaders)
+        }
+
+        Log.d(TAG, "Final headers: $headers")
+        return headers
+    }
+
     fun setUrl(rawUrl: String) {
         val url = normalizeUrl(rawUrl)
+        Log.d(TAG, "Playing URL: $url")
 
         // 截图覆盖防黑底
         if (isSurfaceAvailable && textureView.isAvailable) {
@@ -160,19 +187,22 @@ class IjkPlayerPlatformView(
             } catch (_: Exception) {}
         }
 
-        // 复用播放器（注意：需要重新设置headers，因为reset会清空）
+        // 构建 headers
+        val headers = buildHeaders(url)
+
+        // 复用播放器
         val player = mediaPlayer
         if (player != null) {
             try {
                 player.stop()
                 player.reset()
-                configurePlayer(player, currentDecoderMode, url)
+                configurePlayer(player, currentDecoderMode)
                 player.setSurface(currentSurface)
-                // 使用带 headers 的 setDataSource
-                applyDataSource(player, url)
+                applyDataSource(player, url, headers)
                 player.prepareAsync()
                 return
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.e(TAG, "Reuse player failed", e)
                 releasePlayer()
             }
         }
@@ -180,50 +210,46 @@ class IjkPlayerPlatformView(
         // 新建播放器
         val newPlayer = IjkMediaPlayer()
         mediaPlayer = newPlayer
-        configurePlayer(newPlayer, currentDecoderMode, url)
+        configurePlayer(newPlayer, currentDecoderMode)
         currentSurface?.let { newPlayer.setSurface(it) }
 
         try {
-            applyDataSource(newPlayer, url)
+            applyDataSource(newPlayer, url, headers)
             newPlayer.prepareAsync()
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e(TAG, "Prepare failed", e)
             if (retryCount < maxRetries) {
                 retryCount++
                 val newMode = if (currentDecoderMode == 0) 1 else 0
                 currentDecoderMode = newMode
                 releasePlayer()
-                setUrl(rawUrl) // 递归重试
+                setUrl(rawUrl) // 重试
             } else {
-                methodChannel?.invokeMethod("onError", mapOf("what" to -1, "extra" to -1))
+                methodChannel?.invokeMethod("onError", mapOf(
+                    "what" to -1,
+                    "extra" to (e.message ?: "Unknown error")
+                ))
             }
         }
     }
 
-    /**
-     * 根据是否有 headers，选择不同的 setDataSource 方法
-     */
-    private fun applyDataSource(player: IjkMediaPlayer, url: String) {
-        val headers = currentHeaders
-        if (headers != null && headers.isNotEmpty()) {
-            // 使用带 headers 的重载
+    private fun applyDataSource(player: IjkMediaPlayer, url: String, headers: Map<String, String>) {
+        if (headers.isNotEmpty()) {
             player.setDataSource(contextRef, Uri.parse(url), headers)
+            Log.d(TAG, "Applied data source with headers")
         } else {
-            // 普通方式
             player.dataSource = url
+            Log.d(TAG, "Applied data source without headers")
         }
     }
 
-    /**
-     * 配置播放器参数（同之前，保持不变，但确保 Referer 也通过 headers 方式可覆盖）
-     */
-    private fun configurePlayer(player: IjkMediaPlayer, decoderMode: Int, url: String) {
-        // ===== 基础音频 =====
+    private fun configurePlayer(player: IjkMediaPlayer, decoderMode: Int) {
+        // 基础音频
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "opensles", 0L)
         player.setAudioStreamType(AudioManager.STREAM_MUSIC)
         player.setScreenOnWhilePlaying(true)
 
-        // ===== 解码器 =====
+        // 解码器
         when (decoderMode) {
             0 -> {
                 player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "mediacodec-all-videos", 1L)
@@ -242,12 +268,12 @@ class IjkPlayerPlatformView(
             }
         }
 
-        // ===== 探测参数 =====
+        // 探测参数
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "probesize", 1024 * 1024L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", 10 * 1000 * 1000L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzemaxduration", 15 * 1000 * 1000L)
 
-        // ===== 网络协议 =====
+        // 协议白名单
         player.setOption(
             IjkMediaPlayer.OPT_CATEGORY_FORMAT,
             "protocol_whitelist",
@@ -256,18 +282,7 @@ class IjkPlayerPlatformView(
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "rtsp_transport", "tcp")
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "http-detect-range-support", 0L)
 
-        // ===== 请求头模拟（基础） =====
-        player.setOption(
-            IjkMediaPlayer.OPT_CATEGORY_FORMAT,
-            "user_agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        // Referer：自动添加，但可通过 headers 覆盖
-        getDomainFromUrl(url)?.let { domain ->
-            player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "referer", domain)
-        }
-
-        // ===== 缓冲与重连 =====
+        // 缓冲与重连
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "packet-buffering", 1L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max-buffer-size", 4 * 1024 * 1024L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "min-frames", 3L)
@@ -283,7 +298,7 @@ class IjkPlayerPlatformView(
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "dns_cache_clear", 1L)
         player.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "enable-accurate-seek", 1L)
 
-        // ===== 监听器 =====
+        // 监听器
         player.setOnPreparedListener { it.start() }
         player.setOnInfoListener { _, what, extra ->
             if (what == 3) {
@@ -292,6 +307,7 @@ class IjkPlayerPlatformView(
                     snapView.setImageBitmap(null)
                 }
             }
+            Log.d(TAG, "onInfo: what=$what, extra=$extra")
             methodChannel?.invokeMethod("onInfo", mapOf("what" to what, "extra" to extra))
             true
         }
@@ -300,6 +316,7 @@ class IjkPlayerPlatformView(
                 snapView.visibility = View.GONE
                 snapView.setImageBitmap(null)
             }
+            Log.e(TAG, "onError: what=$what, extra=$extra")
             methodChannel?.invokeMethod("onError", mapOf("what" to what, "extra" to extra))
             true
         }
