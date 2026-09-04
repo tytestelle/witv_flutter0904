@@ -7,6 +7,8 @@ class IjkPlayerWidget extends StatefulWidget {
   final int decoderIndex;
   final VoidCallback? onError;
   final ValueChanged<double>? onSpeedUpdate;
+  /// 可选的自定义请求头，会覆盖默认头
+  final Map<String, String>? headers;
 
   const IjkPlayerWidget({
     Key? key,
@@ -14,6 +16,7 @@ class IjkPlayerWidget extends StatefulWidget {
     this.decoderIndex = 0,
     this.onError,
     this.onSpeedUpdate,
+    this.headers,
   }) : super(key: key);
 
   @override
@@ -25,6 +28,24 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   Timer? _speedTimer;
   bool _isLoading = true;
 
+  /// 默认请求头（模仿酷9的 OKhttp/1.31）
+  Map<String, String> get _defaultHeaders => {
+    'User-Agent': 'OKhttp/1.31',
+    'Accept': '*/*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Accept-Encoding': 'gzip, deflate',
+    'Connection': 'keep-alive',
+  };
+
+  /// 合并默认头和自定义头
+  Map<String, String> get _mergedHeaders {
+    final base = Map<String, String>.from(_defaultHeaders);
+    if (widget.headers != null) {
+      base.addAll(widget.headers!);
+    }
+    return base;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -34,8 +55,9 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   @override
   void didUpdateWidget(covariant IjkPlayerWidget oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // 关键：URL 变化时不复建 PlatformView，直接发 setUrl 指令
-    if (widget.url != oldWidget.url || widget.decoderIndex != oldWidget.decoderIndex) {
+    if (widget.url != oldWidget.url ||
+        widget.decoderIndex != oldWidget.decoderIndex ||
+        widget.headers != oldWidget.headers) {
       _setUrl(widget.url, widget.decoderIndex);
     }
   }
@@ -71,6 +93,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     _channel?.invokeMethod('setUrl', {
       'url': url,
       'decoderIndex': decoderIndex,
+      'headers': _mergedHeaders,   // 传递合并后的请求头
     });
   }
 
