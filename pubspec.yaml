@@ -21,6 +21,7 @@ dependencies:
   flutter_svg: ^2.0.9
   crypto: ^3.0.0
   http: ^1.2.0
+  flutter_js: ^0.8.0
   image: ^4.9.1
   sqflite: ^2.3.2
   path: ^1.8.3
@@ -38,6 +39,7 @@ flutter:
     - assets/configuration.json
     - assets/epg_data.json
     - assets/js/
+    - assets/js/crypto.js
  
     
 
