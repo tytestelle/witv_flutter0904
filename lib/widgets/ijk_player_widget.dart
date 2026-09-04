@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import '../parsers/video_parser.dart'; // 引入解析器
+import 'package:http/http.dart' as http;
+import 'dart:convert';
 
 class IjkPlayerWidget extends StatefulWidget {
   final String url;
@@ -9,7 +10,6 @@ class IjkPlayerWidget extends StatefulWidget {
   final VoidCallback? onError;
   final ValueChanged<double>? onSpeedUpdate;
   final Map<String, String>? headers;
-  final VideoParser? parser; // 自定义解析器
 
   const IjkPlayerWidget({
     Key? key,
@@ -18,7 +18,6 @@ class IjkPlayerWidget extends StatefulWidget {
     this.onError,
     this.onSpeedUpdate,
     this.headers,
-    this.parser,
   }) : super(key: key);
 
   @override
@@ -29,7 +28,6 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   MethodChannel? _channel;
   Timer? _speedTimer;
   bool _isLoading = true;
-  bool _isParsing = false; // 新增解析状态
 
   Map<String, String> get _defaultHeaders => {
     'User-Agent': 'OKhttp/1.31',
@@ -51,8 +49,6 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   void initState() {
     super.initState();
     _startSpeedTimer();
-    // 初始化时解析URL
-    _resolveAndPlay();
   }
 
   @override
@@ -60,9 +56,8 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     super.didUpdateWidget(oldWidget);
     if (widget.url != oldWidget.url ||
         widget.decoderIndex != oldWidget.decoderIndex ||
-        widget.headers != oldWidget.headers ||
-        widget.parser != oldWidget.parser) {
-      _resolveAndPlay();
+        widget.headers != oldWidget.headers) {
+      _play(widget.url, widget.decoderIndex);
     }
   }
 
@@ -89,32 +84,65 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
           break;
       }
     });
-    // 注意：播放器的创建在 _resolveAndPlay 中完成
+    _play(widget.url, widget.decoderIndex);
   }
 
-  /// 解析URL并播放
-  Future<void> _resolveAndPlay() async {
-    if (mounted) setState(() => _isParsing = true);
+  /// 解析 URL，提取真实视频地址
+  Future<String> _resolveUrl(String url) async {
+    // 如果已经是标准流地址，直接返回
+    if (url.startsWith('http') && 
+        (url.endsWith('.m3u8') || url.endsWith('.mp4') || url.endsWith('.ts') || url.endsWith('.flv'))) {
+      return url;
+    }
+
     try {
-      // 如果提供了自定义解析器，使用它；否则使用默认解析器
-      final parser = widget.parser ?? DefaultVideoParser.parse;
-      final realUrl = await parser(widget.url);
-      if (mounted) {
-        setState(() => _isParsing = false);
-        _setUrl(realUrl, widget.decoderIndex);
+      final response = await http.get(
+        Uri.parse(url),
+        headers: _mergedHeaders, // 使用和播放器相同的 headers
+      );
+
+      if (response.statusCode != 200) {
+        return url;
       }
+
+      final body = response.body.trim();
+
+      // 1. M3U8
+      if (body.startsWith('#EXTM3U')) {
+        return url;
+      }
+
+      // 2. JSON
+      if (body.startsWith('{') || body.startsWith('[')) {
+        try {
+          final json = jsonDecode(body);
+          if (json is Map) {
+            if (json['url'] != null && json['url'].toString().isNotEmpty) return json['url'].toString();
+            if (json['data'] != null && json['data']['url'] != null) return json['data']['url'].toString();
+            if (json['stream_url'] != null) return json['stream_url'].toString();
+            if (json['play_url'] != null) return json['play_url'].toString();
+          }
+        } catch (_) {}
+      }
+
+      // 3. 正则提取
+      final regex = RegExp(r'https?://[^\s"\'<>]+\.(?:m3u8|mp4|ts|flv)');
+      final match = regex.firstMatch(body);
+      if (match != null) {
+        return match.group(0)!;
+      }
+
+      return url;
     } catch (e) {
-      if (mounted) {
-        setState(() => _isParsing = false);
-        _setUrl(widget.url, widget.decoderIndex); // 解析失败时尝试原始URL
-      }
+      return url;
     }
   }
 
-  void _setUrl(String url, int decoderIndex) {
+  Future<void> _play(String url, int decoderIndex) async {
     if (mounted) setState(() => _isLoading = true);
+    final realUrl = await _resolveUrl(url);
     _channel?.invokeMethod('setUrl', {
-      'url': url,
+      'url': realUrl,
       'decoderIndex': decoderIndex,
       'headers': _mergedHeaders,
     });
@@ -141,7 +169,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
           creationParamsCodec: const StandardMessageCodec(),
           onPlatformViewCreated: _onPlatformViewCreated,
         ),
-        if (_isLoading || _isParsing)
+        if (_isLoading)
           Container(
             color: Colors.black,
             child: const Center(
