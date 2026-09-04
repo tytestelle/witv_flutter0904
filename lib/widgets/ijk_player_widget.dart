@@ -11,7 +11,7 @@ class IjkPlayerWidget extends StatefulWidget {
   final VoidCallback? onError;
   final ValueChanged<double>? onSpeedUpdate;
   final Map<String, String>? headers;
-  final String? secretKey; // 解密密钥，从外部传入
+  final String? secretKey;
 
   const IjkPlayerWidget({
     Key? key,
@@ -61,7 +61,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   Future<void> _initCrypto() async {
     try {
       final cryptoJsContent = await rootBundle.loadString('assets/js/crypto.js');
-      // 将 crypto.js 包装并暴露 CryptoJS 到全局
+      // 包装脚本，暴露 CryptoJS 到全局
       final wrappedScript = '''
         (function() {
           ${cryptoJsContent}
@@ -159,7 +159,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
 
       // 3. AES 加密（酷9常见格式：U2FsdGVkX1...）
       if (body.startsWith('U2FsdGVkX1') && _cryptoReady) {
-        final key = widget.secretKey ?? 'default_key'; // 请替换为实际密钥
+        final key = widget.secretKey ?? 'default_key';
         final decrypted = await _decryptAES(body, key);
         if (decrypted != null && decrypted.isNotEmpty) {
           if (decrypted.startsWith('http')) return decrypted;
@@ -170,11 +170,20 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
         }
       }
 
-      // 4. 正则提取 URL（修正：使用双引号原始字符串）
-      final regex = RegExp(r"https?://[^\s\"'<>]+\.(?:m3u8|mp4|ts|flv)");
-      final match = regex.firstMatch(body);
-      if (match != null) return match.group(0)!;
+      // 4. 简单提取：查找 http:// 开头的链接（避免正则转义问题）
+      final start = body.indexOf('http://');
+      if (start != -1) {
+        final end = body.indexOf(' ', start);
+        final candidate = end == -1 ? body.substring(start) : body.substring(start, end);
+        if (candidate.endsWith('.m3u8') || 
+            candidate.endsWith('.mp4') || 
+            candidate.endsWith('.ts') || 
+            candidate.endsWith('.flv')) {
+          return candidate;
+        }
+      }
 
+      // 5. 如果什么都没提取到，返回原 URL
       return url;
     } catch (e) {
       return url;
