@@ -33,9 +33,9 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   bool _isLoading = true;
   late JavascriptRuntime _jsRuntime;
   bool _cryptoReady = false;
-  String _debugInfo = '准备...';
+  String _debugInfo = '初始化...';
 
-  // 酷9的请求头（完整复制）
+  // 酷9常用的请求头（完全复制）
   Map<String, String> get _cool9Headers => {
     'User-Agent': 'OKhttp/1.31',
     'Accept': '*/*',
@@ -66,16 +66,12 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     _jsRuntime = getJavascriptRuntime();
     _initCrypto();
     _startSpeedTimer();
-    // 延迟一帧确保 channel 已准备好
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _play(widget.url, widget.decoderIndex);
-    });
+    _play(widget.url, widget.decoderIndex);
   }
 
   Future<void> _initCrypto() async {
     try {
       final cryptoJsContent = await rootBundle.loadString('assets/js/crypto.js');
-      // 注意：crypto.js 是模块，我们直接注入并暴露 CryptoJS
       final wrappedScript = '''
         (function() {
           ${cryptoJsContent}
@@ -88,7 +84,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
       ''';
       _jsRuntime.evaluate(wrappedScript);
       _cryptoReady = true;
-      _updateDebug('CryptoJS 就绪');
+      _updateDebug('CryptoJS 加载成功');
     } catch (e) {
       _updateDebug('CryptoJS 加载失败: $e');
     }
@@ -140,7 +136,6 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     });
   }
 
-  /// 核心解析器，尝试所有酷9可能的方式
   Future<String> _resolveUrl(String url) async {
     _updateDebug('开始解析: $url');
     if (url.startsWith('http') && 
@@ -150,53 +145,43 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     }
 
     try {
-      _updateDebug('发送HTTP请求...');
+      _updateDebug('发起HTTP请求...');
       final response = await http.get(
         Uri.parse(url),
         headers: _mergedHeaders,
       );
       _updateDebug('HTTP状态: ${response.statusCode}');
-      if (response.statusCode != 200) {
-        _updateDebug('HTTP错误，返回原URL');
-        return url;
-      }
+      if (response.statusCode != 200) return url;
       final body = response.body.trim();
       _updateDebug('响应预览: ${body.substring(0, body.length > 100 ? 100 : body.length)}');
 
-      // 1. M3U8
       if (body.startsWith('#EXTM3U')) {
         _updateDebug('M3U8内容，直接播放');
         return url;
       }
 
-      // 2. JSON 提取
       if (body.startsWith('{') || body.startsWith('[')) {
         try {
           final json = jsonDecode(body);
-          _updateDebug('JSON解析成功');
           if (json is Map) {
-            // 常见字段
-            for (var key in ['url', 'stream_url', 'play_url', 'video_url', 'data.url']) {
-              final parts = key.split('.');
-              var current = json;
-              var found = true;
-              for (var part in parts) {
-                if (current is Map && current.containsKey(part)) {
-                  current = current[part];
-                } else {
-                  found = false;
-                  break;
-                }
-              }
-              if (found && current is String && current.isNotEmpty) {
-                _updateDebug('从JSON提取: $current');
-                return current;
+            // 尝试提取常见字段
+            for (var key in ['url', 'stream_url', 'play_url', 'video_url']) {
+              final value = json[key];
+              if (value is String && value.isNotEmpty) {
+                _updateDebug('从JSON提取: $value');
+                return value;
               }
             }
-            // 如果顶层就包含 url
-            if (json.containsKey('url') && json['url'] is String && json['url'].isNotEmpty) {
-              _updateDebug('从JSON.url提取: ${json['url']}');
-              return json['url'];
+            // 尝试 data.url
+            if (json.containsKey('data') && json['data'] is Map) {
+              final data = json['data'] as Map;
+              for (var key in ['url', 'stream_url', 'play_url']) {
+                final value = data[key];
+                if (value is String && value.isNotEmpty) {
+                  _updateDebug('从JSON.data提取: $value');
+                  return value;
+                }
+              }
             }
           }
         } catch (e) {
@@ -204,7 +189,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
         }
       }
 
-      // 3. AES 加密
+      // AES 加密
       if (body.startsWith('U2FsdGVkX1') && _cryptoReady) {
         _updateDebug('检测到AES加密，尝试解密...');
         final key = widget.secretKey ?? 'default_key';
@@ -215,14 +200,17 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
           try {
             final json = jsonDecode(decrypted);
             if (json is Map && json.containsKey('url')) {
-              _updateDebug('从解密JSON提取: ${json['url']}');
-              return json['url'];
+              final value = json['url'];
+              if (value is String && value.isNotEmpty) {
+                _updateDebug('从解密JSON提取: $value');
+                return value;
+              }
             }
           } catch (_) {}
         }
       }
 
-      // 4. 简单提取 http://... 链接
+      // 简单提取 http://
       final start = body.indexOf('http://');
       if (start != -1) {
         final end = body.indexOf(' ', start);
@@ -304,13 +292,10 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
                     child: CircularProgressIndicator(strokeWidth: 2.5),
                   ),
                   const SizedBox(height: 16),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 20),
-                    child: Text(
-                      _debugInfo,
-                      style: const TextStyle(color: Colors.white, fontSize: 14),
-                      textAlign: TextAlign.center,
-                    ),
+                  Text(
+                    _debugInfo,
+                    style: const TextStyle(color: Colors.white, fontSize: 12),
+                    textAlign: TextAlign.center,
                   ),
                 ],
               ),
