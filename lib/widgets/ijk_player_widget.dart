@@ -1,9 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_js/flutter_js.dart';
 import 'package:http/http.dart' as http;
-import 'dart:convert';
 
 class IjkPlayerWidget extends StatefulWidget {
   final String url;
@@ -35,8 +35,8 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   bool _cryptoReady = false;
   String _debugInfo = '初始化...';
 
-  // 酷9常用的请求头（完全复制）
-  Map<String, String> get _cool9Headers => {
+  // TVBox 风格的请求头
+  Map<String, String> get _tvBoxHeaders => {
     'User-Agent': 'OKhttp/1.31',
     'Accept': '*/*',
     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
@@ -47,7 +47,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
   };
 
   Map<String, String> get _mergedHeaders {
-    final base = Map<String, String>.from(_cool9Headers);
+    final base = Map<String, String>.from(_tvBoxHeaders);
     try {
       final uri = Uri.parse(widget.url);
       base['Referer'] = '${uri.scheme}://${uri.host}/';
@@ -136,62 +136,95 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
     });
   }
 
+  /// TVBox 风格解析器：先请求 → 判读响应类型 → 提取地址
   Future<String> _resolveUrl(String url) async {
     _updateDebug('开始解析: $url');
-    if (url.startsWith('http') && 
-        (url.endsWith('.m3u8') || url.endsWith('.mp4') || url.endsWith('.ts') || url.endsWith('.flv'))) {
+
+    // 如果已经是标准流地址，直接返回
+    if (url.startsWith('http') &&
+        (url.endsWith('.m3u8') || url.endsWith('.mp4') ||
+         url.endsWith('.ts') || url.endsWith('.flv'))) {
       _updateDebug('标准流，直接播放');
       return url;
     }
 
     try {
-      _updateDebug('发起HTTP请求...');
-      final response = await http.get(
-        Uri.parse(url),
-        headers: _mergedHeaders,
-      );
-      _updateDebug('HTTP状态: ${response.statusCode}');
-      if (response.statusCode != 200) return url;
-      final body = response.body.trim();
-      _updateDebug('响应预览: ${body.substring(0, body.length > 100 ? 100 : body.length)}');
+      _updateDebug('发起HTTP请求 (超时15秒)...');
+      final response = await http
+          .get(
+            Uri.parse(url),
+            headers: _mergedHeaders,
+          )
+          .timeout(const Duration(seconds: 15), onTimeout: () {
+            throw Exception('请求超时');
+          });
 
-      if (body.startsWith('#EXTM3U')) {
-        _updateDebug('M3U8内容，直接播放');
+      _updateDebug('HTTP状态: ${response.statusCode}');
+      if (response.statusCode != 200) {
+        _updateDebug('HTTP非200，返回原URL');
         return url;
       }
 
+      final body = response.body.trim();
+      _updateDebug('响应长度: ${body.length} 字符');
+      final preview = body.length > 200 ? body.substring(0, 200) : body;
+      _updateDebug('响应预览: $preview');
+
+      // ============================================================
+      // 以下逻辑完全参考 TVBox 的 LivePlayActivity 解析流程
+      // ============================================================
+
+      // 1. 如果是 M3U8 内容，直接播放
+      if (body.startsWith('#EXTM3U')) {
+        _updateDebug('检测到 M3U8 内容');
+        return url;
+      }
+
+      // 2. 尝试 JSON 解析（TVBox 最常见的直播源格式）
       if (body.startsWith('{') || body.startsWith('[')) {
         try {
           final json = jsonDecode(body);
+          _updateDebug('JSON 解析成功');
+
+          // TVBox 常见的 JSON 字段：url, stream_url, play_url, video_url, data.url
           if (json is Map) {
-            // 尝试提取常见字段
+            // 检查顶层字段
             for (var key in ['url', 'stream_url', 'play_url', 'video_url']) {
               final value = json[key];
-              if (value is String && value.isNotEmpty) {
-                _updateDebug('从JSON提取: $value');
+              if (value is String && value.isNotEmpty && value.startsWith('http')) {
+                _updateDebug('从 JSON 提取: $value');
                 return value;
               }
             }
-            // 尝试 data.url
+            // 检查 data 嵌套
             if (json.containsKey('data') && json['data'] is Map) {
               final data = json['data'] as Map;
               for (var key in ['url', 'stream_url', 'play_url']) {
                 final value = data[key];
-                if (value is String && value.isNotEmpty) {
-                  _updateDebug('从JSON.data提取: $value');
+                if (value is String && value.isNotEmpty && value.startsWith('http')) {
+                  _updateDebug('从 JSON.data 提取: $value');
                   return value;
                 }
               }
             }
+            // TVBox 有时直接把地址放在第一个字符串值里
+            for (var value in json.values) {
+              if (value is String && value.startsWith('http') &&
+                  (value.endsWith('.m3u8') || value.endsWith('.mp4') ||
+                   value.endsWith('.ts') || value.endsWith('.flv'))) {
+                _updateDebug('从 JSON 值提取: $value');
+                return value;
+              }
+            }
           }
         } catch (e) {
-          _updateDebug('JSON解析失败: $e');
+          _updateDebug('JSON 解析失败: $e');
         }
       }
 
-      // AES 加密
+      // 3. AES 加密（TVBox 常见：U2FsdGVkX1... 开头的 AES 密文）
       if (body.startsWith('U2FsdGVkX1') && _cryptoReady) {
-        _updateDebug('检测到AES加密，尝试解密...');
+        _updateDebug('检测到 AES 加密，尝试解密...');
         final key = widget.secretKey ?? 'default_key';
         final decrypted = await _decryptAES(body, key);
         if (decrypted != null && decrypted.isNotEmpty) {
@@ -202,7 +235,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
             if (json is Map && json.containsKey('url')) {
               final value = json['url'];
               if (value is String && value.isNotEmpty) {
-                _updateDebug('从解密JSON提取: $value');
+                _updateDebug('从解密 JSON 提取: $value');
                 return value;
               }
             }
@@ -210,12 +243,43 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
         }
       }
 
-      // 简单提取 http://
+      // 4. Base64 编码（TVBox 也常见）
+      try {
+        final decoded = base64Decode(body);
+        final decodedStr = utf8.decode(decoded);
+        if (decodedStr.startsWith('http')) {
+          _updateDebug('Base64 解码得到地址: $decodedStr');
+          return decodedStr;
+        }
+        // 解码后可能是 JSON
+        if (decodedStr.startsWith('{') || decodedStr.startsWith('[')) {
+          final json = jsonDecode(decodedStr);
+          if (json is Map) {
+            for (var key in ['url', 'stream_url', 'play_url']) {
+              final value = json[key];
+              if (value is String && value.isNotEmpty && value.startsWith('http')) {
+                _updateDebug('从 Base64 解码的 JSON 提取: $value');
+                return value;
+              }
+            }
+          }
+        }
+      } catch (_) {}
+
+      // 5. 正则提取（TVBox fallback）
+      final regex = RegExp(r'https?://[^\s"\'<>]+\.(?:m3u8|mp4|ts|flv)');
+      final match = regex.firstMatch(body);
+      if (match != null) {
+        _updateDebug('正则提取: ${match.group(0)}');
+        return match.group(0)!;
+      }
+
+      // 6. 简单提取 http:// 开头的链接
       final start = body.indexOf('http://');
       if (start != -1) {
         final end = body.indexOf(' ', start);
         final candidate = end == -1 ? body.substring(start) : body.substring(start, end);
-        if (candidate.endsWith('.m3u8') || candidate.endsWith('.mp4') || 
+        if (candidate.endsWith('.m3u8') || candidate.endsWith('.mp4') ||
             candidate.endsWith('.ts') || candidate.endsWith('.flv')) {
           _updateDebug('简单提取: $candidate');
           return candidate;
@@ -241,7 +305,7 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
       final result = _jsRuntime.evaluate(script);
       return result.stringResult;
     } catch (e) {
-      _updateDebug('AES解密失败: $e');
+      _updateDebug('AES 解密失败: $e');
       return null;
     }
   }
@@ -283,21 +347,24 @@ class _IjkPlayerWidgetState extends State<IjkPlayerWidget> {
           Container(
             color: Colors.black,
             child: Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const SizedBox(
-                    width: 36,
-                    height: 36,
-                    child: CircularProgressIndicator(strokeWidth: 2.5),
-                  ),
-                  const SizedBox(height: 16),
-                  Text(
-                    _debugInfo,
-                    style: const TextStyle(color: Colors.white, fontSize: 12),
-                    textAlign: TextAlign.center,
-                  ),
-                ],
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const SizedBox(
+                      width: 36,
+                      height: 36,
+                      child: CircularProgressIndicator(strokeWidth: 2.5),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      _debugInfo,
+                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
